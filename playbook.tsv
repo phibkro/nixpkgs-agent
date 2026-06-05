@@ -1,0 +1,11 @@
+name	signature	fix_hint
+hash_mismatch_generic	hash mismatch in fixed-output derivation.*specified: (sha256-\S+).*got:\s+(sha256-\S+)	sed -i 's|<specified>|<got>|' in the matching package.nix
+darwin_libgcc_s_1	ld: library not found for -lgcc_s\.1	bump -mmacosx-version-min from 10.5 to 10.6 in the upstream Makefile (postPatch / substituteInPlace)
+darwin_flto_unknown	ld: unknown option: -flto=full	drop -flto=full LDFLAG on darwin (postPatch substituteInPlace on Makefile)
+darwin_icu_76_undefined	Undefined symbols.*architecture.*_ucnv_\w+_76	icu-i18n.pc declares icu-uc as Requires.private; force ICU_LIBS="-licui18n -licuuc -licudata" in a darwin-only preConfigure
+darwin_codesign_missing	tcc: error: command failed 'codesign	add darwin.sigtool to nativeBuildInputs (or disable installCheck on darwin if the tests still fail past codesign)
+darwin_nasm_elf_macho	archive member.*is not mach-o	pass --disable-asm on darwin (nasm emits ELF by default; build doesn't pass -f macho64)
+darwin_sysv_shm_sandbox	(Failed to create share|shmop_open with IPC_PRIVATE|Failed to create share at)	tests need SysV shm; set doCheck = !stdenv.hostPlatform.isDarwin
+darwin_sandbox_postPatch_stale	rm: cannot remove '\S+_test\.go': No such file or directory	stale darwin-conditional postPatch refers to files that moved/were deleted upstream — drop the rm lines
+darwin_patchelf_mach_o	find: 'patchelf': No such file or directory	preFixup uses patchelf (ELF-only); gate on stdenv.hostPlatform.isLinux
+sqlite_db_locked	Error: database is locked	sqlite3 .backup ran while a writer held the lock; add ".timeout 30000" before the .backup dot-command
