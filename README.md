@@ -52,20 +52,23 @@ additional binds** (`--ro-allow` is intentionally absent):
 | Path | Access |
 |---|---|
 | `$PWD` (the worktree) | bound RW |
-| `~/.claude` + `~/.claude.json` | bound RW (agent's own state) |
+| `~/.config/opencode` + `~/.local/share/opencode` + `~/.cache/opencode` | bound RW (opencode state) |
 | `/tmp` | tmpfs (writeable scratch) |
 | `/nix/store` | RO (toolchain) |
 | `/nix/var/nix/daemon-socket` | bound (`nix-build` works) |
 | `/etc` (selected paths) | RO (`/etc/{static,profiles,resolv.conf,ssl,passwd,group}`) |
-| `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/{sops,age,gh,op}`, … | denied |
-| `~/.config/git` | denied — **no commit identity inside; don't commit** |
+| `GIT_{AUTHOR,COMMITTER}_{NAME,EMAIL}` | injected as env (`nixpkgs-agent <noreply@…>`) |
+| `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/{sops,age,gh,op}`, `~/.claude`, … | denied |
+| `~/.config/git` | denied (identity comes from env vars instead) |
 | `$HOME` everywhere else | tmpfs |
 | Network | **full** for now (phase-1 caveat) |
 
-The agent cannot commit, cannot push, cannot read any user-side secret,
-cannot reach the wider home directory. **The deliverable is the working-tree
-diff**; the human runs `git diff` from outside the sandbox and writes the
-commit + PR. The agent should never `git commit` inside the sandbox.
+The agent **can** commit to its `fix-<pkg>-darwin` branch — git identity is
+injected via env vars so commits are explicitly authored as
+`nixpkgs-agent <noreply@nixpkgs-agent.invalid>`. It **cannot** push (no
+SSH key inside, no GitHub token) — the operator pulls the branch from outside
+and pushes to their fork. On exit, the agent drops `.agent-status` (`ready`
+or `giving up — <reason>`) so the wrapper knows what to do next.
 
 **Network egress will tighten** when [Claw Patrol] — pagu's
 credential-injecting egress proxy — ships. Until then, the agent is told
@@ -118,9 +121,36 @@ The diff is the output.
 - **Restricted egress** via nftables in the sandbox.
 - **Live Hydra polling** in `discover/hydra-fails.sh` to replace the `/tmp/tails/`
   cache. The eval JSON API is patchy; HTML scraping likely needed.
-- **opencode + gemma + pagu-box as the agent runtime** is the second-most-interesting
-  path (free local LLM + tool use). Currently broken: ollama serves the response
-  but opencode produces no visible stdout. Worth a separate debug session.
+- **opencode + gemma + box** is now wired up but only smoke-tested on toy
+  prompts. The "no stdout" issue was gemma's default 4k context being eaten
+  by opencode's system prompt + tool registry; resolved via a 32k Modelfile
+  alias (`gemma4:12b-32k`). Real package smoke tests pending.
 - **Merge-aware `learn.sh`.** Today it destroys hand-edits on re-run (backed up
   to `.prev`); a real merge that preserves the human notes is needed before this
   is automatic.
+
+## Local LLM provider (Ollama) notes
+
+The harness ships pointed at `ollama-local/gemma4:12b-32k`, an alias created
+via this Modelfile:
+
+```
+FROM gemma4:12b
+PARAMETER num_ctx 32768
+```
+
+```sh
+ollama create gemma4:12b-32k -f Modelfile
+```
+
+Out-of-the-box `gemma4:12b` defaults to a 4k context, which opencode's system
+prompt + 64-skill registry blows past instantly (verified: `output: 1, reason:
+length`). 32k clears that with headroom; KV cache at fp16 is ~12 GB on the
+5060 Ti's 16 GB.
+
+**Bump-up note:** if 32k feels tight in practice, **try 48k fp16 next**.
+That sits just over the 5060 Ti's VRAM ceiling (~18 GB KV), so it'll need
+either CPU-offload of the overflow (`OLLAMA_KV_CACHE_TYPE=q8_0` is the
+cleanest knob — int8 KV brings 48k back to ~9 GB) or a model with smaller
+per-token KV. Don't jump to 64k+ without also switching to int4 KV (real
+quality risk).

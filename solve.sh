@@ -13,21 +13,26 @@
 #   ./solve.sh <package> --branch fix-libmspub-darwin
 #   ./solve.sh <package> --hydra-build 330238590
 #
-# The sandbox boundary is pagu-box's strict profile, no extras:
+# The sandbox boundary is pagu-box's strict profile + the minimum extras
+# opencode needs to remember its session:
 #   * $PWD (the worktree)         — bound RW
-#   * ~/.claude                   — agent state
-#   * ~/.claude.json              — agent config
+#   * ~/.config/opencode          — opencode config (provider, model)
+#   * ~/.local/share/opencode     — opencode session state (sqlite DB)
+#   * ~/.cache/opencode           — opencode models index
 #   * /tmp, /nix/store, /etc      — toolchain (via strict's defaults)
 #   * $HOME everywhere else       — tmpfs (no ~/.ssh, no ~/.config/git,
-#                                   no ~/.aws, etc.)
+#                                   no ~/.aws, no ~/.claude, etc.)
 #   * Network                     — FULL for now (phase 1 caveat).
 #                                   Future: Claw Patrol — pagu's
 #                                   credential-injecting egress proxy,
 #                                   currently on pagu's roadmap.
 #
-# Because ~/.config/git is denied, commits from inside the sandbox would
-# either fail or be authored as "nobody". The agent is told NOT to
-# commit. The diff is the deliverable.
+# Git identity is injected via environment variables (GIT_AUTHOR_NAME etc.)
+# — ~/.config/git is NOT bound, so the agent's commits are explicitly
+# tagged as nixpkgs-agent, not the operator. The agent CAN commit to its
+# own branch; it CANNOT push (no SSH key, no GitHub token in the sandbox).
+# On exit, it writes a sentinel file the wrapper script picks up to know
+# whether the diff is ready for the operator to push.
 
 set -euo pipefail
 
@@ -101,34 +106,36 @@ CONTEXT_FILE="$WORKTREE/.agent-context.md"
   echo
   echo "## Capabilities available to you"
   echo
-  echo "- **Any nixpkgs tool, on demand.** \`nix shell nixpkgs#<pkg> -c <cmd>\` pulls"
-  echo "  anything from nixpkgs without installing — ripgrep, jq, curl, patchutils,"
-  echo "  scc, hyperfine, the lot. Don't get blocked on \"\$X is not on PATH\";"
-  echo "  reach for nix shell first."
+  echo "- **Any nixpkgs tool, on demand.** \`nix shell nixpkgs#<pkg> -c <cmd>\`"
+  echo "  pulls anything from nixpkgs without installing — ripgrep, jq, curl,"
+  echo "  patchutils, scc, hyperfine, the lot. Don't get blocked on"
+  echo "  \"\$X is not on PATH\"; reach for nix shell first."
   echo "- **nix-build** is your verification tool. \`nix-build -A $PKG --no-out-link\`"
-  echo "  on linux; \`ssh nori@100.102.29.85 'cd ~/nixpkgs && nix-build -A $PKG'\`"
-  echo "  if the bug is darwin-only (the workstation Mac is reachable from this"
-  echo "  sandbox)."
-  echo "- **Web access** is available — use WebFetch / WebSearch for canonical"
-  echo "  reference material. Lean on it. The first-rank sources for nixpkgs"
-  echo "  fixes are:"
-  echo "    - nixpkgs source itself: https://github.com/NixOS/nixpkgs (search PRs"
-  echo "      and issues for the same package + the same error signature; the"
-  echo "      maintainers' answer is usually findable)"
+  echo "  is what you should run after every edit. Only linux builds are"
+  echo "  available inside this sandbox (no ssh credentials in here). If the"
+  echo "  failure is darwin-only, document the fix and let the operator verify."
+  echo "- **Web access**. Lean on WebFetch / WebSearch for canonical reference"
+  echo "  material. Highest-quality sources, in order:"
+  echo "    - nixpkgs source itself: https://github.com/NixOS/nixpkgs"
+  echo "      (search PRs and issues for this package + the same error signature;"
+  echo "      maintainers' answers are usually findable)"
   echo "    - The nixpkgs manual: https://nixos.org/manual/nixpkgs/"
-  echo "    - upstream source / issues for the package being fixed"
+  echo "    - Upstream source + issue tracker for the package being fixed"
   echo "    - Apple's developer docs (for darwin failures)"
-  echo "    - StackOverflow / GitHub Discussions if all else fails"
-  echo "  When you find a referenced fix, write the URL in the changelog / commit"
+  echo "    - StackOverflow / GitHub Discussions as fallback"
+  echo "  When a reference informs your fix, **cite the URL** in the commit"
   echo "  message so the human reviewer can verify."
-  echo "- **Git** is on PATH; use it for blame, log, diff, etc. Don't \`git commit\`"
-  echo "  inside the sandbox — there is no user identity here. Leave the diff in"
-  echo "  the working tree; the human applies it from outside."
+  echo "- **Git is configured.** \`git config user.name\` and \`user.email\` are"
+  echo "  injected as env vars (you'll see \`nixpkgs-agent <noreply@…>\`). Commit"
+  echo "  freely on the current branch (\`$BRANCH\`). Don't try to push — there"
+  echo "  are no credentials in the sandbox; the operator pushes from outside."
   echo
   echo "## What you CANNOT do"
   echo
-  echo "- Push, open PRs, or any GitHub write action (no credentials in the sandbox)"
-  echo "- Touch \$HOME outside ~/.claude (denied by pagu-box strict)"
+  echo "- Push to any remote, or open a PR (no credentials)"
+  echo "- SSH anywhere (no SSH key inside)"
+  echo "- Touch \$HOME outside ~/.config/opencode + ~/.local/share/opencode +"
+  echo "  ~/.cache/opencode (your own state)"
   echo "- Modify nixpkgs anywhere outside this worktree"
   echo
   echo "## Your job"
@@ -143,15 +150,33 @@ CONTEXT_FILE="$WORKTREE/.agent-context.md"
   echo "3. Edit the package.nix (or add a patch). Prefer a REAL fix over a"
   echo "   test-disable; if the test-disable is the only reasonable answer,"
   echo "   leave a comment in the package.nix explaining the trade-off."
-  echo "4. Verify with \`nix-build\` (see Capabilities above)."
-  echo "5. When the build is green, leave the worktree as-is and exit."
-  echo "   The human runs \`git diff\` and writes the commit + PR."
+  echo "4. Verify with \`nix-build -A $PKG --no-out-link\` until green."
+  echo "5. \`git add\` + \`git commit\` a single coherent commit on \`$BRANCH\`."
+  echo "   Conventional shape: \`$PKG: <what changed>\` subject, body explains"
+  echo "   the cause and cites references."
+  echo "6. Drop a sentinel file when you're done so the operator picks it up:"
+  echo "   \`echo \"ready\" > .agent-status\` (or \`echo \"giving up — \$REASON\""
+  echo "   > .agent-status\` if you couldn't fix it). Then exit."
 } > "$CONTEXT_FILE"
 
-# ---- spawn agent inside pagu-box strict, no extras ----
-# Sandbox is the worktree + ~/.claude + ~/.claude.json + the standard
-# tmpfs $HOME / RO toolchain. No ~/.config/git (so no commits — by design),
-# no ~/.ssh, no ~/.aws, no ~/.config/{sops,age,gh}, no ~/.nix-profile bind
-# (the nix daemon socket via /nix/var/nix/daemon-socket is enough).
+# ---- spawn agent inside pagu-box strict ----
+# Opencode (not Claude): no Anthropic credential needed in the sandbox.
+# Allow opencode state to persist so it can resume sessions across
+# invocations. Git identity is set in the calling env and passed through
+# pagu-box's --env so the agent CAN commit to its branch. It cannot push
+# (no SSH key, no GitHub token).
 cd "$WORKTREE"
-exec pagu-box --profile=strict -- claude
+export GIT_AUTHOR_NAME="nixpkgs-agent"
+export GIT_AUTHOR_EMAIL="noreply@nixpkgs-agent.invalid"
+export GIT_COMMITTER_NAME="nixpkgs-agent"
+export GIT_COMMITTER_EMAIL="noreply@nixpkgs-agent.invalid"
+
+exec box --profile=strict \
+  --allow "$HOME/.config/opencode" \
+  --allow "$HOME/.local/share/opencode" \
+  --allow "$HOME/.cache/opencode" \
+  --env GIT_AUTHOR_NAME \
+  --env GIT_AUTHOR_EMAIL \
+  --env GIT_COMMITTER_NAME \
+  --env GIT_COMMITTER_EMAIL \
+  -- opencode --model 'ollama-local/gemma4:12b-32k'
