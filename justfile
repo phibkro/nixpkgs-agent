@@ -30,3 +30,10 @@ default: dryrun
 # Re-codify the per-package skill from current nixpkgs HEAD.
 @learn pkg:
     ./learn.sh {{pkg}}
+
+# Spawn a minimal agent harness on a failing package — pagu-box --profile=strict
+# scoped to a fresh nixpkgs worktree on a fix-<pkg>-darwin branch. Human reviews
+# the diff before pushing; the sandbox has no SSH key.
+# Usage: just solve libmspub
+@solve pkg *args:
+    ./solve.sh {{pkg}} {{args}}

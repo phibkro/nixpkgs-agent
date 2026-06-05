@@ -1,81 +1,113 @@
-# nixpkgs-agent (phase 0)
+# nixpkgs-agent
 
-Read-only scaffolding for an agent that triages nixpkgs build failures and suggests fixes — no PRs, no commits, no upstream interaction. The eventual goal (phases 1-4) is automated fix suggestions on the operator's own fork; phase 0 only proves out **discovery + classification + a local-LLM fallback** in dry-run.
+A minimal agent harness for fixing nixpkgs build failures. The agent runs inside
+`pagu-box --profile=strict` scoped to a fresh git worktree of nixpkgs on a fix
+branch. It has read/write bash, the nix toolchain, git identity, and network
+access. It cannot push (no SSH key in the sandbox) — the diff goes back to the
+human for review and forwarding.
 
-Sibling of [pagu] and [pagu-box] — same hermit-crab family. Soft, untrusted agent inside a hard shell of mandatory build verification. Phase 0 has no shell yet because nothing is acted on; it's pure observation.
+Sibling of [pagu] and [pagu-box] — same hermit-crab family. Soft, untrusted
+agent inside a hard shell. The shell is the worktree + pagu-box; the agent is
+whatever you spawn inside (Claude Code currently; opencode+gemma when its
+pipeline stops hanging).
+
+## The shape
+
+```
+just solve libmspub
+  │
+  └─ git worktree add -B fix-libmspub-darwin upstream/master
+     │
+     └─ pagu-box --profile=strict + worktree paths bound
+        │
+        └─ claude (started with a starting prompt containing failure log + task)
+           │
+           └─ … iterates: read package.nix, edit, nix-build, repeat …
+              │
+              └─ commit + exit
+                  │
+                  └─ human: git diff → review → push to fork
+```
+
+## Components
 
 [pagu]: https://github.com/phibkro/pagu
 [pagu-box]: https://github.com/phibkro/pagu-box
 
-## What it does
+| Path | Role |
+|---|---|
+| `solve.sh` | The minimal agent harness. Spins up a worktree, writes `.agent-context.md` with the failure log + task, launches Claude under pagu-box. |
+| `playbook.tsv` | Fast-path signatures. The starting prompt includes any match — saves the agent a round trip when the failure mode is one we've seen. |
+| `classify.sh` | Match a build-log tail against the playbook. Tiny, fast, no LLM. |
+| `agent-ask.sh` | Direct Ollama HTTP triage. Useful for batch surveys without spinning a full agent. |
+| `learn.sh` | Per-package update procedure codification — reads nixpkgs git history + package shape and writes `skills/<pkg>.md` for future bumps. |
+| `discover/hydra-fails.sh` | Currently reads from `/tmp/tails/*.tail` cache. Live polling is TODO. |
+| `discover/r-ryantm-stuck.sh` | List failing r-ryantm version-bump PRs (a recurring source of stuck-on-stale-hash PRs). |
 
-1. **Discover** failure candidates (failing Hydra builds; stuck r-ryantm PRs).
-2. **Classify** each by matching the build-log tail against `playbook.tsv` signatures.
-3. **Fallback** for unmatched: ask `gemma4:12b` via local Ollama to describe the likely fix.
-4. **Print** a dry-run report to stdout — what it _would_ do, if it could.
+## Sandbox boundary
 
-No PRs are opened. No code is modified. The fix recipes themselves don't run; only their _signatures_ run, to match. This is the read-only data-gathering phase that informs whether phases 1+ are worth building.
+`solve.sh` wraps the agent in `pagu-box --profile=strict` with:
 
-## Layout
+| Path | Access |
+|---|---|
+| `$PWD` (the worktree) | bound RW |
+| `~/.claude` | bound RW (agent state) |
+| `~/.config/git` | RO (commit identity) |
+| `~/.nix-profile`, `~/.local/state/nix`, `~/.deno` | RO toolchain |
+| `~/.ssh`, `~/.gnupg`, `~/.aws`, …  | denied (pagu-box strict) |
+| `$HOME` everywhere else | tmpfs |
+| Network | **full** (phase-1 caveat — restricted egress is a TODO) |
 
-```
-playbook.tsv               # recipes: name, signature, fix-hint
-playbook/                  # (future) one shell snippet per recipe
-discover/
-  hydra-fails.sh           # poll Hydra for x86_64-darwin failures
-  r-ryantm-stuck.sh        # list r-ryantm PRs with failing CI
-lib/
-  log-tail.sh              # fetch + brotli-decompress a Hydra build log tail
-classify.sh                # match a log tail against playbook signatures
-agent-ask.sh               # fallback: ask local gemma4:12b via Ollama
-dryrun.sh                  # orchestrate everything; print "would-do" report
-```
+The agent has no SSH key, so it cannot push. Anything that needs to leave the
+sandbox (PR open, push) is the operator's call.
 
 ## Run
 
 ```sh
-./dryrun.sh                       # everything: discover → classify → ask gemma → report
-./discover/hydra-fails.sh         # just the discovery layer
-./classify.sh < some-tail.log     # match one log against the playbook
-./agent-ask.sh < some-tail.log    # ask gemma4:12b only
+just solve libmspub                              # worktree + agent on the bug
+just solve libmspub --hydra-build 330238590      # explicit Hydra failure to seed
+just classify libmspub                           # signature-only triage from cache
+just ask libmspub                                # direct gemma triage
+just learn opencode                              # codify update procedure
 ```
 
-Output is JSONL-on-stdout: one candidate per line, with the matched recipe (or `gemma_suggested`) and a one-line fix hint.
+## Threat model
 
-## Threat model (yes, even at phase 0)
+The agent has read/write inside a worktree and full network. Three real attacks:
 
-This phase only reads. The risks are:
+1. **Prompt-injected build log.** A package's failure log contains attacker-crafted
+   text engineered to convince the agent to e.g. add a backdoored fetchpatch.
+   Mitigation: human review of the diff before pushing. Build verification is
+   not enough — the agent could write a backdoor that builds fine.
+2. **Exfil via curl in the build.** The agent could add a `postBuild` that POSTs
+   data somewhere. The sandbox has no secrets to exfil; the worktree is a public
+   nixpkgs fork. So the actual risk is just polluting the diff. Caught at review.
+3. **Wasted CI cycles upstream.** A bad PR forwarded by the human burns reviewer
+   time. Cost: a PR comment.
 
-- **Ollama prompt-injection from a malicious build log.** If a build log contains attacker-controlled text engineered to trick gemma into a misleading suggestion, the human reviewer still has to land the fix. Mitigation: the agent never writes code in phase 0.
-- **Hydra rate limits.** Polling discovery scripts respect `Cache-Control`. Cap is `2 polls/min`.
-- **Cost.** Local gemma4:12b is free; the cost is GPU minutes on workstation.
+### Acknowledged limitations
 
-When phases 1+ start writing diffs, the threat model has to be redone — that's a different document.
+- **No restricted egress yet.** "Egress to nix sites + StackOverflow only" was the
+  ideal; pagu-box doesn't support per-domain whitelisting. v1 trusts the agent to
+  behave + audits the diff. Tightening this is a real TODO — likely via a
+  network-namespace + nftables rules approach.
+- **No automatic submission.** Push to fork is the operator's call after reviewing
+  the diff. This is the deliberate gate — no autonomous PRs.
 
 ## Status
 
-Phase 0 only. Pieces individually verified:
+`solve.sh` is the actual deliverable. Run it on any failing package and the agent
+gets a worktree, the failure log, the playbook hint, and the keys to nix-build.
+The diff is the output.
 
-- `classify.sh` — matches 3/5 of today's PRs against the playbook
-  (dasm/lrzip/sambamba match by signature; bacula and cpufetch needed unique fixes not in the playbook).
-- `agent-ask.sh` against `gemma4:12b` via Ollama — produced reasonable triage for bacula
-  (identified missing-symbol shape; suggested checking deps/config). Useful as a
-  human-review signal even when it's not the exact fix.
-- `learn.sh` — writes `skills/<pkg>.md` from git log + heuristic field detection. Phase
-  0 destroys hand-edits on re-run (mitigation: `.prev` backup); proper merge is a phase
-  0.5 task.
+### TODOs
 
-### Known TODOs
-
-- `discover/hydra-fails.sh` falls back to the local `/tmp/tails/*.tail` cache.
-  Phase 0.5: scrape failing jobs from Hydra's eval HTML; use `lib/log-tail.sh`
-  to fetch tails on demand.
-- `dryrun.sh` has a JSON-pipe glitch (likely jq-spawn overhead + chunk fragility).
-  Each underlying script works individually; the orchestrator needs a rewrite that
-  buffers cleanly.
-- **opencode + gemma4:12b inside pagu-box** as a richer LLM runtime was tested
-  (with `provider.ollama-local` in `~/.config/opencode/opencode.jsonc`). ollama
-  serves responses (14s 200, 4k tokens) but opencode produces no visible stdout —
-  likely a TUI-vs-pipe issue or a gemma response-shape mismatch with opencode's
-  tool-use parser. Direct ollama API (`agent-ask.sh`) is the working path for
-  phase 0. Opencode-as-runtime is a phase 1 task pending that debug.
+- **Restricted egress** via nftables in the sandbox.
+- **Live Hydra polling** in `discover/hydra-fails.sh` to replace the `/tmp/tails/`
+  cache. The eval JSON API is patchy; HTML scraping likely needed.
+- **opencode + gemma + pagu-box as the agent runtime** is the second-most-interesting
+  path (free local LLM + tool use). Currently broken: ollama serves the response
+  but opencode produces no visible stdout. Worth a separate debug session.
+- **Merge-aware `learn.sh`.** Today it destroys hand-edits on re-run (backed up
+  to `.prev`); a real merge that preserves the human notes is needed before this
+  is automatic.
