@@ -46,20 +46,33 @@ just solve libmspub
 
 ## Sandbox boundary
 
-`solve.sh` wraps the agent in `pagu-box --profile=strict` with:
+`solve.sh` wraps the agent in `pagu-box --profile=strict` with **no
+additional binds** (`--ro-allow` is intentionally absent):
 
 | Path | Access |
 |---|---|
 | `$PWD` (the worktree) | bound RW |
-| `~/.claude` | bound RW (agent state) |
-| `~/.config/git` | RO (commit identity) |
-| `~/.nix-profile`, `~/.local/state/nix`, `~/.deno` | RO toolchain |
-| `~/.ssh`, `~/.gnupg`, `~/.aws`, …  | denied (pagu-box strict) |
+| `~/.claude` + `~/.claude.json` | bound RW (agent's own state) |
+| `/tmp` | tmpfs (writeable scratch) |
+| `/nix/store` | RO (toolchain) |
+| `/nix/var/nix/daemon-socket` | bound (`nix-build` works) |
+| `/etc` (selected paths) | RO (`/etc/{static,profiles,resolv.conf,ssl,passwd,group}`) |
+| `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/{sops,age,gh,op}`, … | denied |
+| `~/.config/git` | denied — **no commit identity inside; don't commit** |
 | `$HOME` everywhere else | tmpfs |
-| Network | **full** (phase-1 caveat — restricted egress is a TODO) |
+| Network | **full** for now (phase-1 caveat) |
 
-The agent has no SSH key, so it cannot push. Anything that needs to leave the
-sandbox (PR open, push) is the operator's call.
+The agent cannot commit, cannot push, cannot read any user-side secret,
+cannot reach the wider home directory. **The deliverable is the working-tree
+diff**; the human runs `git diff` from outside the sandbox and writes the
+commit + PR. The agent should never `git commit` inside the sandbox.
+
+**Network egress will tighten** when [Claw Patrol] — pagu's
+credential-injecting egress proxy — ships. Until then, the agent is told
+which sites it should consult (nixpkgs, the manual, upstream sources,
+StackOverflow) via the starting prompt. Audit happens at the diff.
+
+[Claw Patrol]: https://github.com/phibkro/pagu/blob/main/ROADMAP.md
 
 ## Run
 

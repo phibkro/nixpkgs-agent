@@ -13,13 +13,21 @@
 #   ./solve.sh <package> --branch fix-libmspub-darwin
 #   ./solve.sh <package> --hydra-build 330238590
 #
-# The sandbox boundary is pagu-box's strict profile:
+# The sandbox boundary is pagu-box's strict profile, no extras:
 #   * $PWD (the worktree)         — bound RW
 #   * ~/.claude                   — agent state
-#   * ~/.config/git               — RO (commits get identity)
-#   * ~/.nix-profile, /nix/store  — RO toolchain
-#   * $HOME everywhere else       — tmpfs
-#   * Network                     — FULL (phase 1 caveat; restricted-egress TODO)
+#   * ~/.claude.json              — agent config
+#   * /tmp, /nix/store, /etc      — toolchain (via strict's defaults)
+#   * $HOME everywhere else       — tmpfs (no ~/.ssh, no ~/.config/git,
+#                                   no ~/.aws, etc.)
+#   * Network                     — FULL for now (phase 1 caveat).
+#                                   Future: Claw Patrol — pagu's
+#                                   credential-injecting egress proxy,
+#                                   currently on pagu's roadmap.
+#
+# Because ~/.config/git is denied, commits from inside the sandbox would
+# either fail or be authored as "nobody". The agent is told NOT to
+# commit. The diff is the deliverable.
 
 set -euo pipefail
 
@@ -91,27 +99,59 @@ CONTEXT_FILE="$WORKTREE/.agent-context.md"
     echo "(no classification — no log to match against)"
   fi
   echo
+  echo "## Capabilities available to you"
+  echo
+  echo "- **Any nixpkgs tool, on demand.** \`nix shell nixpkgs#<pkg> -c <cmd>\` pulls"
+  echo "  anything from nixpkgs without installing — ripgrep, jq, curl, patchutils,"
+  echo "  scc, hyperfine, the lot. Don't get blocked on \"\$X is not on PATH\";"
+  echo "  reach for nix shell first."
+  echo "- **nix-build** is your verification tool. \`nix-build -A $PKG --no-out-link\`"
+  echo "  on linux; \`ssh nori@100.102.29.85 'cd ~/nixpkgs && nix-build -A $PKG'\`"
+  echo "  if the bug is darwin-only (the workstation Mac is reachable from this"
+  echo "  sandbox)."
+  echo "- **Web access** is available — use WebFetch / WebSearch for canonical"
+  echo "  reference material. Lean on it. The first-rank sources for nixpkgs"
+  echo "  fixes are:"
+  echo "    - nixpkgs source itself: https://github.com/NixOS/nixpkgs (search PRs"
+  echo "      and issues for the same package + the same error signature; the"
+  echo "      maintainers' answer is usually findable)"
+  echo "    - The nixpkgs manual: https://nixos.org/manual/nixpkgs/"
+  echo "    - upstream source / issues for the package being fixed"
+  echo "    - Apple's developer docs (for darwin failures)"
+  echo "    - StackOverflow / GitHub Discussions if all else fails"
+  echo "  When you find a referenced fix, write the URL in the changelog / commit"
+  echo "  message so the human reviewer can verify."
+  echo "- **Git** is on PATH; use it for blame, log, diff, etc. Don't \`git commit\`"
+  echo "  inside the sandbox — there is no user identity here. Leave the diff in"
+  echo "  the working tree; the human applies it from outside."
+  echo
+  echo "## What you CANNOT do"
+  echo
+  echo "- Push, open PRs, or any GitHub write action (no credentials in the sandbox)"
+  echo "- Touch \$HOME outside ~/.claude (denied by pagu-box strict)"
+  echo "- Modify nixpkgs anywhere outside this worktree"
+  echo
   echo "## Your job"
   echo
-  echo "1. Diagnose the failure from the log above (and \`git log -- pkgs/.../\$PKG\` if helpful)."
-  echo "2. Edit the package.nix (or add a patch). Prefer a REAL fix over a test-disable;"
-  echo "   if the test-disable is the right call, say so explicitly in the commit message."
-  echo "3. Verify with \`nix-build -A $PKG --no-out-link\` (Linux) or by ssh-ing to mac"
-  echo "   (\`ssh nori@100.102.29.85 'cd ~/nixpkgs && nix-build -A $PKG'\`)"
-  echo "   if the bug is darwin-only."
-  echo "4. When the build is green, commit with conventional \`<pkg>: <what changed>\`"
-  echo "   plus a body explaining the cause and the fix."
-  echo "5. Exit. The human reviews the diff before pushing."
-  echo
-  echo "You CANNOT push (no SSH key in the sandbox) or open PRs from in here — the human does that."
+  echo "1. Diagnose the failure from the log above. Look at:"
+  echo "   - \`git log --oneline -10 -- <package-path>\` for prior bumps"
+  echo "   - existing patches / postPatch / preConfigure in the package.nix"
+  echo "   - whether the failure signature is darwin-specific, sandbox-specific,"
+  echo "     or a real upstream bug"
+  echo "2. Search the canonical references (see above) for the same error."
+  echo "   If somebody has fixed this exact shape before, copy their approach."
+  echo "3. Edit the package.nix (or add a patch). Prefer a REAL fix over a"
+  echo "   test-disable; if the test-disable is the only reasonable answer,"
+  echo "   leave a comment in the package.nix explaining the trade-off."
+  echo "4. Verify with \`nix-build\` (see Capabilities above)."
+  echo "5. When the build is green, leave the worktree as-is and exit."
+  echo "   The human runs \`git diff\` and writes the commit + PR."
 } > "$CONTEXT_FILE"
 
-# ---- spawn agent inside pagu-box strict ----
+# ---- spawn agent inside pagu-box strict, no extras ----
+# Sandbox is the worktree + ~/.claude + ~/.claude.json + the standard
+# tmpfs $HOME / RO toolchain. No ~/.config/git (so no commits — by design),
+# no ~/.ssh, no ~/.aws, no ~/.config/{sops,age,gh}, no ~/.nix-profile bind
+# (the nix daemon socket via /nix/var/nix/daemon-socket is enough).
 cd "$WORKTREE"
-exec pagu-box --profile=strict \
-  --ro-allow "$HOME/.config/git" \
-  --ro-allow "$HOME/.nix-profile" \
-  --ro-allow "$HOME/.local/state/nix" \
-  --ro-allow "$HOME/.deno" \
-  --allow "/srv/share/projects/nixpkgs" \
-  -- claude
+exec pagu-box --profile=strict -- claude
